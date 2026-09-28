@@ -218,6 +218,10 @@ def analyze(tickers, daily_map, h1_map, live_map, min_adv_m, near_pct):
         atr_now = float(atr.iloc[-1])
         atr_up = atr_now > float(atr.iloc[-6]) or atr_now >= float(atr.iloc[-20:].max())
         atr_ratio = atr_now / float(atr.iloc[-20:].mean())
+        ema20 = float(d["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(d["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
+        trend = ("Up" if ema20 > ema50 and price > ema50 else
+                 "Down" if ema20 < ema50 and price < ema50 else "Neutral")
 
         if mult is None:
             adv, vol_ok = np.nan, True
@@ -252,7 +256,7 @@ def analyze(tickers, daily_map, h1_map, live_map, min_adv_m, near_pct):
                      "Score": score if passed else np.nan, "Price": price,
                      "Chg %": (price / prev_close - 1) * 100 if prev_close else np.nan,
                      "ADV ($M)": adv / 1e6 if pd.notna(adv) else np.nan,
-                     "ATR ratio": round(atr_ratio, 2), "Bias": bias,
+                     "ATR ratio": round(atr_ratio, 2), "Bias": bias, "Trend": trend,
                      "Liquidity": lvl_n, "Level": lvl, "Opp name": opp_n, "Opp level": opp,
                      "Distance %": round(dist, 2) if np.isfinite(dist) else np.nan})
     df = pd.DataFrame(rows)
@@ -332,7 +336,7 @@ def _scan_long(h, l, c, ssl, bsl, buf):
                         tp2 = min(above) if above else None
                         rr = reward_risk(entry, sl, tp1, tp2)
                         s = {"bar": i, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-                             "rr": rr, "level": lvl}
+                             "rr": rr, "level": lvl, "mss_bar": midx, "fvg_size": fvg[0] - fvg[1]}
                         if tp1 is None or tp2 is None:
                             s["status"], s["end"] = "Skipped – no target", i
                         elif rr < MIN_RR:
@@ -366,72 +370,79 @@ def detect_setup(m15, levels, buf):
     if not found:
         return None
     s = max(found, key=lambda x: x["bar"])
+    atr = wilder_atr(df).to_numpy(float)
+    mb = s["mss_bar"]
+    s["disp_atr"] = (h[mb] - l[mb]) / atr[mb] if atr[mb] > 0 else 0.0
+    s["fvg_atr"] = s["fvg_size"] / atr[s["bar"]] if atr[s["bar"]] > 0 else 0.0
+    s["level_name"] = next((k for k, v in levels.items() if abs(v - s["level"]) < 1e-9), "HTF level")
     s["time"] = df.index[s["bar"]]
     s["active"] = s["status"] in ACTIVE
     return s
 
 
-def projected_plan(row, m15, levels, buf):
-    """Estimated levels while waiting for the sweep (firm up once a 15M MSS + FVG forms)."""
-    if m15 is None or len(m15) < 60 or pd.isna(row.get("Level")):
-        return None
-    df = m15.tail(500)
-    atr15 = float(wilder_atr(df).iloc[-1])
-    h, l = df["High"].to_numpy(float), df["Low"].to_numpy(float)
-    lvl, n = float(row["Level"]), len(df)
-    if row["Bias"] == "LONG":
-        entry, sl = lvl + 0.5 * atr15, lvl - atr15 - buf
-        tp1 = nearest_unmitigated(h, pivot_flags(h, K15), n - 1, entry)
-        above = [v for k, v in levels.items() if "high" in k and v > (tp1 or entry)]
-        tp2 = min(above) if above else None
-    else:
-        nh = -l
-        entry, sl = lvl - 0.5 * atr15, lvl + atr15 + buf
-        t1 = nearest_unmitigated(nh, pivot_flags(nh, K15), n - 1, -entry)
-        tp1 = -t1 if t1 is not None else None
-        below = [v for k, v in levels.items() if "low" in k and v < (tp1 or entry)]
-        tp2 = max(below) if below else None
-    return {"dir": row["Bias"], "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-            "rr": reward_risk(entry, sl, tp1, tp2), "level": lvl,
-            "status": f"Waiting for sweep of {row['Liquidity']}", "active": False}
+# ─────────────────────────── A+ grading ───────────────────────────
+def in_killzone(ts):
+    """London 07:00–10:00 UTC or New York 12:00–16:00 UTC."""
+    hr = ts.hour + ts.minute / 60
+    return 7 <= hr < 10 or 12 <= hr < 16
+
+
+def grade(row, s, min_rr, need_trend, need_session):
+    checks = {
+        "Passed weekly screen": row["Status"] == "PASS",
+        "Live 15M setup (sweep + MSS + FVG)": bool(s.get("active")),
+        f"Reward:risk ≥ 1:{min_rr:g}": bool(s.get("rr")) and s["rr"] >= min_rr,
+        "Strong displacement (MSS candle ≥ 1.2× ATR)": s.get("disp_atr", 0) >= 1.2,
+        "Clean FVG (≥ 0.25× ATR)": s.get("fvg_atr", 0) >= 0.25,
+    }
+    if need_trend:
+        checks["With the daily trend"] = ((s["dir"] == "LONG" and row.get("Trend") == "Up") or
+                                          (s["dir"] == "SHORT" and row.get("Trend") == "Down"))
+    if need_session:
+        checks["Formed in London / New York session"] = in_killzone(s["time"])
+    return checks
 
 
 # ─────────────────────────── UI ───────────────────────────
-def plan_card(t, row, plan, risk_cash):
-    kind = "🟢 LIVE SETUP" if plan.get("active") else "🟡 PROJECTED"
-    st.markdown(f"**{kind}** — {plan['status']}")
+def setup_card(t, row, s, checks, risk_cash):
+    st.success(f"### A+ {s['dir']} — {row['Asset']} ({t})")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Entry (limit)", fmt(plan["entry"], t))
-    c2.metric("Stop loss", fmt(plan["sl"], t))
-    c3.metric("TP1 (50%)", fmt(plan["tp1"], t))
+    c1.metric("Live price", fmt(row["Price"], t),
+              f"{row['Chg %']:+.2f}%" if pd.notna(row.get("Chg %")) else None)
+    c2.metric("Status", s["status"])
+    c3.metric("Reward : risk", f"1 : {s['rr']:.2f}")
     c4, c5, c6 = st.columns(3)
-    c4.metric("TP2 (50%)", fmt(plan["tp2"], t))
-    rr = plan.get("rr")
-    c5.metric("Reward : risk", f"1 : {rr:.2f}" if rr else "–",
-              ("meets 1:2.5" if rr and rr >= MIN_RR else "below 1:2.5") if rr else None,
-              delta_color="normal" if rr and rr >= MIN_RR else "inverse")
-    c6.metric("Size (1% risk)", position_size(t, risk_cash, plan["entry"], plan["sl"]))
-    if plan.get("active"):
-        st.caption(f"15M setup formed {plan['time']:%a %H:%M} UTC: swept {fmt(plan['level'], t)}, "
-                   "MSS + FVG confirmed. Move stop to entry once TP1 fills.")
-    else:
-        st.caption(f"Estimate only. Wait for price to sweep {row['Liquidity']} ({fmt(row['Level'], t)}), "
-                   "then a 15M MSS + FVG. The card switches to LIVE SETUP with exact levels when it forms.")
+    c4.metric("Entry (limit)", fmt(s["entry"], t))
+    c5.metric("Stop loss", fmt(s["sl"], t))
+    c6.metric("Size (1% risk)", position_size(t, risk_cash, s["entry"], s["sl"]))
+    c7, c8, _ = st.columns(3)
+    c7.metric("TP1 (close 50%)", fmt(s["tp1"], t))
+    c8.metric("TP2 (close 50%)", fmt(s["tp2"], t))
+    st.caption(f"Swept **{s['level_name']}** ({fmt(s['level'], t)}) · setup formed "
+               f"{s['time']:%a %H:%M} UTC · {len(checks)}/{len(checks)} checks: "
+               + " · ".join(f"✅ {k}" for k in checks)
+               + ". Move the stop to entry once TP1 fills.")
 
 
 def main():
-    st.set_page_config(page_title="LS-AS Live Screener", page_icon="🎯", layout="wide")
-    st.title("🎯 LS-AS Live Screener")
+    st.set_page_config(page_title="LS-AS A+ Setups", page_icon="🎯", layout="wide")
+    st.title("🎯 LS-AS A+ Setups")
 
     with st.sidebar:
-        st.header("Settings")
+        st.header("Account")
         account = st.number_input("Total account ($)", min_value=1000.0, value=100000.0, step=1000.0)
         active_pct = st.slider("Active trading capital (%)", 5, 100, 20)
         risk_pct = st.number_input("Risk per trade (% of active)", 0.1, 5.0, 1.0, 0.1)
+        st.header("A+ criteria")
+        min_rr = st.number_input("Min reward:risk", 2.5, 10.0, 3.0, 0.5)
+        need_trend = st.toggle("Must agree with daily trend", value=True)
+        need_session = st.toggle("Must form in London / NY session", value=True)
+        st.header("Weekly screen")
         min_adv = st.number_input("Min avg daily $ volume ($M)", 0.0, 100000.0, 500.0, 50.0)
         near_pct = st.number_input("Max distance to liquidity (%)", 0.1, 10.0, 2.0, 0.1)
-        auto = st.toggle("Auto-refresh live prices", value=True)
-        every = st.select_slider("Refresh every (seconds)", [15, 30, 60, 120], value=30)
+        st.header("Refresh")
+        auto = st.toggle("Auto-refresh", value=True)
+        every = st.select_slider("Every (seconds)", [15, 30, 60, 120], value=30)
         if st.button("🔄 Reload all data"):
             st.cache_data.clear()
     risk_cash = account * active_pct / 100 * risk_pct / 100
@@ -453,96 +464,71 @@ def main():
                     for t in tickers}
         df, levels_map = analyze(tickers, daily, h1, live_map, min_adv, near_pct)
 
-        plans = {}
+        aplus, misses = [], []
         for _, row in df[df["Status"] != "NO DATA"].iterrows():
             t = row["Ticker"]
-            buf = stop_buffer(t, row["Price"])
-            setup = detect_setup(m15.get(t), levels_map.get(t, {}), buf)
-            plans[t] = setup if setup and setup["active"] else projected_plan(row, m15.get(t),
-                                                                              levels_map.get(t, {}), buf)
+            s = detect_setup(m15.get(t), levels_map.get(t, {}), stop_buffer(t, row["Price"]))
+            if not s or not s["active"]:
+                continue
+            checks = grade(row, s, min_rr, need_trend, need_session)
+            if all(checks.values()):
+                aplus.append((t, row, s, checks))
+            else:
+                misses.append({"Asset": f"{row['Asset']} ({t})", "Direction": s["dir"],
+                               "Status": s["status"], "R:R": f"{s['rr']:.2f}" if s.get("rr") else "–",
+                               "Missing": " · ".join(k for k, ok in checks.items() if not ok)})
+        aplus.sort(key=lambda x: (x[2]["status"] != "Order working", -x[2]["rr"]))
 
-        passed = df[df["Status"] == "PASS"].copy()
-        passed["live"] = passed["Ticker"].map(lambda t: bool(plans.get(t) and plans[t].get("active")))
-        passed = passed.sort_values(["live", "Score"], ascending=[False, False])
+        st.caption(f"Risk per trade **${risk_cash:,.0f}** · scanned {len(df)} assets · updated "
+                   f"{datetime.now(timezone.utc):%H:%M:%S} UTC"
+                   + (f" · rescanning every {every}s" if auto else ""))
 
-        st.caption(f"Risk per trade: **${risk_cash:,.0f}** · Updated "
-                   f"{datetime.now(timezone.utc):%H:%M:%S} UTC" + (f" · refreshing every {every}s" if auto else ""))
-
-        # ── Top pick ──
-        if passed.empty:
-            st.warning(f"**No {market.lower() if market != 'All' else ''} asset passes all filters right now.** "
-                       "Per the rules, sit out or check another market.")
-            default_pick = df.iloc[0]["Ticker"]
+        if not aplus:
+            st.info(f"**No A+ setups right now{'' if market == 'All' else ' in ' + market}.** "
+                    "Most of the time this is the correct answer — the app keeps scanning.")
+            watch = df[df["Status"] == "PASS"]
+            if len(watch):
+                st.caption("Watching for sweeps: " + " · ".join(
+                    f"{r['Asset']} ({'below' if r['Bias'] == 'LONG' else 'above'} {fmt(r['Level'], r['Ticker'])})"
+                    for _, r in watch.head(6).iterrows()))
         else:
-            top = passed.iloc[0]
-            t = top["Ticker"]
-            default_pick = t
-            st.success(f"### {top['Asset']} ({t}) — {top['Bias']}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Live price", fmt(top["Price"], t),
-                      f"{top['Chg %']:+.2f}%" if pd.notna(top["Chg %"]) else None)
-            c2.metric("Score", f"{top['Score']:.0f} / 100")
-            c3.metric("To liquidity", f"{top['Distance %']:.2f}%")
-            if plans.get(t):
-                plan_card(t, top, plans[t], risk_cash)
-            if len(passed) > 1:
-                ru = passed.iloc[1]
-                st.info(f"**Second slot:** {ru['Asset']} ({ru['Ticker']}) — {ru['Bias']}, score {ru['Score']:.0f}. "
-                        "Skip it if it's correlated with your first pick (e.g. ES + NQ, SPY + VOO).")
+            if len(aplus) > 2:
+                st.warning(f"{len(aplus)} A+ setups — the rules allow **max 2 open trades**. "
+                           "Take the top two and avoid correlated pairs (e.g. ES + NQ).")
+            for t, row, s, checks in aplus:
+                setup_card(t, row, s, checks, risk_cash)
 
-        # ── Market table ──
-        st.subheader(f"{market} — live board")
-        board = []
-        for _, r in df.iterrows():
-            t, p = r["Ticker"], plans.get(r["Ticker"]) or {}
-            board.append({
-                "Asset": f"{r['Asset']} ({t})",
-                "Live": fmt(r.get("Price"), t),
-                "Chg %": f"{r['Chg %']:+.2f}" if pd.notna(r.get("Chg %")) else "–",
-                "Screen": "✅" if r["Status"] == "PASS" else f"— {r['Reason']}",
-                "Bias": r.get("Bias", "–") if r["Status"] != "NO DATA" else "–",
-                "Setup": ("🟢 " if p.get("active") else "🟡 ") + p["status"] if p else "–",
-                "Entry": fmt(p.get("entry"), t), "Stop": fmt(p.get("sl"), t),
-                "TP1": fmt(p.get("tp1"), t), "TP2": fmt(p.get("tp2"), t),
-                "R:R": f"{p['rr']:.2f}" if p.get("rr") else "–",
-            })
-        st.dataframe(pd.DataFrame(board), hide_index=True)
+            st.subheader("15M chart")
+            opts = [x[0] for x in aplus]
+            pick = st.selectbox("Setup", opts, format_func=lambda t: f"{INFO[t][1]} ({t})", key="chart_pick")
+            s = next(x[2] for x in aplus if x[0] == pick)
+            d = m15[pick].tail(160)
+            fig = go.Figure(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"],
+                                           close=d["Close"], name=pick))
+            for key, label, colr in (("level", "Swept level", "#9e9e9e"), ("entry", "Entry", "#2962ff"),
+                                     ("sl", "Stop", "#d50000"), ("tp1", "TP1", "#00c853"),
+                                     ("tp2", "TP2", "#00c853")):
+                if s.get(key) is not None:
+                    fig.add_hline(y=s[key], line_width=1 if key == "level" else 2, line_color=colr,
+                                  line_dash="dot" if key == "level" else "solid", annotation_text=label,
+                                  annotation_position="bottom right", annotation_font_size=11)
+            fig.update_layout(height=440, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=20, b=10))
+            st.plotly_chart(fig, key="chart")
 
-        # ── Chart ──
-        st.subheader("15M chart")
-        opts = [t for t in df["Ticker"] if t in m15 or t in daily]
-        pick = st.selectbox("Asset", opts, index=opts.index(default_pick) if default_pick in opts else 0,
-                            format_func=lambda t: f"{INFO[t][1]} ({t})", key="chart_pick")
-        src = m15.get(pick)
-        d = src.tail(160) if src is not None else daily[pick].tail(90)
-        fig = go.Figure(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"],
-                                       close=d["Close"], name=pick))
-        lo, hi = float(d["Low"].min()), float(d["High"].max())
-        pad = (hi - lo) * 0.3
-        for lname, val in levels_map.get(pick, {}).items():
-            if lo - pad <= val <= hi + pad:
-                fig.add_hline(y=val, line_dash="dot", line_width=1,
-                              line_color="#26a69a" if "low" in lname else "#ef5350",
-                              annotation_text=lname, annotation_position="top left", annotation_font_size=10)
-        p = plans.get(pick) or {}
-        for key, label, colr in (("entry", "Entry", "#2962ff"), ("sl", "Stop", "#d50000"),
-                                 ("tp1", "TP1", "#00c853"), ("tp2", "TP2", "#00c853")):
-            if p.get(key) is not None:
-                fig.add_hline(y=p[key], line_width=2, line_color=colr, annotation_text=label,
-                              annotation_position="bottom right", annotation_font_size=11)
-        fig.update_layout(height=440, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=20, b=10))
-        st.plotly_chart(fig, key="chart")
+        if misses:
+            with st.expander(f"Filtered out: {len(misses)} live setup(s) that aren't A+ (don't trade)"):
+                st.dataframe(pd.DataFrame(misses), hide_index=True)
 
     live_section()
 
     with st.expander("Rules checklist"):
         st.markdown(
+            "- Only trade setups shown as **A+**\n"
             "- Max **2 open trades** across all markets\n"
             "- No trades within 2 hours of CPI, NFP or rate decisions\n"
             "- Stop for the day at **−2%**, for the week at **−5%** (of active capital)\n"
-            "- Move stop to break-even when TP1 is hit\n"
-            "- 🟡 Projected levels are estimates; only act on 🟢 live setups")
-    st.caption("Data: Yahoo Finance (may be delayed ~15 min for some futures/stocks). "
+            "- Move stop to break-even when TP1 is hit")
+    st.caption("Data: Yahoo Finance (some stocks/futures delayed ~15 min). "
                "Educational tool, not financial advice.")
 
 

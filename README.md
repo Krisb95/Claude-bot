@@ -1,11 +1,11 @@
-# LS-AS Live Screener
+# LS-AS A+ Setups
 
 Streamlit app for the LS-AS strategy:
 - Market filter: All / Stocks / Crypto / Commodities / Forex
 - Weekly screen: $ volume, expanding ATR, within 2% of 4H/Daily liquidity
 - Live prices (auto-refresh) and trade levels: entry, stop loss, TP1, TP2, reward:risk, position size
 - 🟢 LIVE SETUP = a 15M sweep + MSS + FVG has formed (exact levels)
-- 🟡 PROJECTED = estimated levels while waiting for the sweep
+- Only A+ setups are shown (all checks must pass); others are listed as filtered out
 
 ## Deploy (free)
 1. Create a public GitHub repo and upload `app.py` and `requirements.txt`
