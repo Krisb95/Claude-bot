@@ -1,16 +1,16 @@
-# LS-AS Weekly Asset Screener
+# LS-AS Live Screener
 
-Streamlit app that screens the LS-AS universe (index futures/ETFs, forex, commodities,
-crypto, mega-caps) for $ volume, ATR expansion and proximity to 4H/Daily liquidity,
-then recommends which asset to trade this week.
+Streamlit app for the LS-AS strategy:
+- Market filter: All / Stocks / Crypto / Commodities / Forex
+- Weekly screen: $ volume, expanding ATR, within 2% of 4H/Daily liquidity
+- Live prices (auto-refresh) and trade levels: entry, stop loss, TP1, TP2, reward:risk, position size
+- 🟢 LIVE SETUP = a 15M sweep + MSS + FVG has formed (exact levels)
+- 🟡 PROJECTED = estimated levels while waiting for the sweep
 
 ## Deploy (free)
-1. Create a public GitHub repo and upload `app.py` and `requirements.txt`.
+1. Create a public GitHub repo and upload `app.py` and `requirements.txt`
+   (replace the old files if updating).
 2. Go to https://share.streamlit.io, sign in with GitHub, click **Create app**.
 3. Pick the repo, set main file to `app.py`, click **Deploy**.
 
-## Run locally
-    pip install -r requirements.txt
-    streamlit run app.py
-
-Data: Yahoo Finance (may be delayed). Educational tool, not financial advice.
+Data: Yahoo Finance (can be delayed). Educational tool, not financial advice.
