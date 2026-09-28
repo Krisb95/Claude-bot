@@ -223,3 +223,52 @@ def run_backtest(df: pd.DataFrame, ticker: str,
         else:
             busy_until = t + params.max_hold_bars
     return trades
+
+
+def scan_universe(instruments, frame_loader, spot_loader=None,
+                  params: Optional[MeanReversionParams] = None, progress=None):
+    """Rank instruments on the mean-reversion rules.
+
+    Returns scanner.RankedCandidate rows so the existing results table, saving
+    and tracking all work unchanged.
+    """
+    from scanner import RankedCandidate
+
+    params = params or MeanReversionParams()
+    out = []
+    total = len(instruments)
+    for i, (label, ticker, key) in enumerate(instruments):
+        if progress:
+            progress(i, total, label)
+        try:
+            df = frame_loader(key)
+            if df is None or df.empty:
+                out.append(RankedCandidate(ticker, label, None, 0.0, "—", "unknown",
+                                            None, None, None, None,
+                                            error="No candles returned."))
+                continue
+            live = None
+            if spot_loader is not None:
+                try:
+                    live = spot_loader(key)
+                except Exception:
+                    live = None
+            plan = analyze(ticker, df, price=live, params=params)
+            out.append(RankedCandidate(
+                ticker=ticker, label=label, direction=plan.direction, score=plan.score,
+                grade=plan.grade, regime=plan.stage, price=plan.price, stop=plan.stop,
+                target=plan.target, reward_risk=plan.reward_risk,
+                note="; ".join(plan.reasons[:3]), entry_status=plan.stage,
+                entry=plan.entry, price_is_live=live is not None,
+                features=plan.features or None))
+        except Exception as e:
+            out.append(RankedCandidate(ticker, label, None, 0.0, "—", "unknown",
+                                        None, None, None, None,
+                                        error=f"{type(e).__name__}: {e}"))
+    if progress:
+        progress(total, total, "done")
+
+    stage_rank = {READY: 0, NO_REJECTION: 1, NO_LEVEL: 2, NOT_EXTENDED: 3}
+    out.sort(key=lambda r: (r.error is not None, stage_rank.get(r.entry_status, 9),
+                             -r.score))
+    return out
