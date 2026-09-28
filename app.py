@@ -575,7 +575,7 @@ def _config_signature(use_tr, params):
                 f"atr={params.stop_atr_mult:g}|tp={params.target_r:g}")
     return "CONFLUENCE"
 
-APP_BUILD = "2026-09-28-b80 (Mean Reversion is the default strategy)"
+APP_BUILD = "2026-09-28-b81 (my strategy runs over your watchlist)"
 
 st.set_page_config(page_title="Bull Run Strategy V2", page_icon="📈", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -1339,9 +1339,23 @@ with tab_scan:
                 f"{1 / (MR_PARAMS.target_r if MR_PARAMS else 0.4):.1f} wins, which is why "
                 f"the stop matters more here, not less."
             )
-            universe_size = st.selectbox(
-                "Scan the top…", [10, 20, 30, 50, 100], index=1, key="uni_size",
-                format_func=lambda n: f"Top {n} by market cap")
+            # Respect whichever coin source is selected — watchlist, high
+            # volume or top by market cap — rather than forcing the top list.
+            if NON_CRYPTO:
+                _lo, _hi, _default_n = uihelpers.scan_count(len(_list))
+                universe_size = (_default_n if _lo is None else
+                                 st.slider(f"How many {market.lower()} to scan",
+                                           _lo, _hi, _default_n, key="uni_noncrypto_n"))
+            elif WATCHLIST_MODE:
+                universe_size = len(_wl_found) + len(_elsewhere) + len(_via_cg)
+                st.caption(f"Running it over your **{_wl_which.lower()}** watchlist — "
+                           f"{universe_size} instruments.")
+            elif HL_MODE:
+                universe_size = hl_count
+            else:
+                universe_size = st.selectbox(
+                    "Scan the top…", [10, 20, 30, 50, 100], index=1, key="uni_size",
+                    format_func=lambda n: f"Top {n} by market cap")
             uni_direction = "Auto"
             uni_min_rr = MR_PARAMS.target_r if MR_PARAMS else 0.4
         elif USE_SWING:
