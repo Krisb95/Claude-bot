@@ -19,6 +19,7 @@ import pandas as pd
 import streamlit as st
 
 import coingecko
+import coinlist
 import exchanges
 import frames as frame_check
 import hyperliquid_data
@@ -28,7 +29,7 @@ import theme
 import universe
 from formatting import format_price
 
-BUILD = "2026-09-27-lab1"
+BUILD = "2026-09-28-lab2"
 
 st.set_page_config(page_title="Strategy Lab", page_icon="⚖️", layout="wide")
 st.markdown(theme.CSS, unsafe_allow_html=True)
@@ -38,8 +39,7 @@ st.caption(f"Build `{BUILD}` · nothing here is saved, and no trades are placed"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _top_coins(limit):
-    coins, note, live = universe.fetch_top_cryptos(limit)
-    return coins, note, live
+    return coinlist.top_coins(limit)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -111,15 +111,14 @@ if st.button("▶ Run the comparison", use_container_width=True):
     if not coins:
         st.error(f"Couldn't load the coin list. {note or ''}")
     else:
-        ids = {c["symbol"].upper(): c["id"] for c in coins}
-        refs, _err = _reference_prices(tuple(sorted(ids.values())))
+        refs, _err = _reference_prices(coinlist.reference_ids(coins))
         swing_r, mr_r, failures = [], [], []
         bar = st.progress(0.0, text="Starting…")
         for i, coin in enumerate(coins):
             sym = coin["symbol"].upper()
             bar.progress(i / max(len(coins), 1), text=f"{i + 1}/{len(coins)} · {sym}")
-            ticker = f"{sym}-USD"
-            ref = refs.get(coin["id"])
+            ticker = coin["ticker"]
+            ref = coinlist.price_for(coin, refs)
             df, src, why = _daily_candles(ticker, ref)
             if df is None:
                 failures.append(f"{sym}: {why or 'no usable daily candles'}")
